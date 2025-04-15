@@ -1531,6 +1531,8 @@ class AShareMarket:
 
     # B.2.2 Value (12)
 
+    
+         
     # B.2.2.3 Quarterly Book-to-Market Equity (bmq)
     def calc_bm(self):
         book_value = self.get_data('FS_Combas', 'A003000000')
@@ -2193,6 +2195,116 @@ class AShareMarket:
         data[universe] = np.nan
 
         return data
+
+    #A2ME（Assets to marketcap）##这个因子好像在1555-1561行已经出现过了
+    def calc_am(self):
+        total_assets = self.get_data('FS_Combas', 'A001000000')
+        market_equity = self.get_data('TRD_Mnth', 'Msmvosd')
+        market_equity = market_equity*1000
+        amq = total_assets / market_equity
+        return amq
+
+    #AT（Total Assets）
+    def calc_at(self):
+        total_assets = self.get_data('FS_Combas', 'A001000000')
+        return total_assets
+
+    #LME（Size）
+    def calc_lme(self):
+        price = self.get_data('TRD_Mnth', 'Mclsprc')    # 收盘价
+        shares_outstanding = self.get_data('TRD_Mnth', 'Msmvosd')  # 千元单位的市值 / Price = 股数 × 价格，所以直接用千元市值再乘1000
+        lme = price * shares_outstanding * 1000      # 乘1000是因为数据单位是千元
+        return lme
+
+    #Beta（CAPM Beta）
+    def calc_capm(self, min_obs_corr=720, min_obs_vol=120):
+        # 获取数据
+        daily_ret = self.get_data('TRD_Dalyr', 'Dretwd')  # 个股日收益率
+        market_ret = self.get_data('TRD_Cndalym', 'Cdretwdos')  # 市场日收益率
+        rf = self.get_data('TRD_Nrrate', 'Nrrdaydt')  # 无风险利率
+        # 统一日期
+        df = daily_ret.copy()
+        df['Trddt'] = df.index
+        df = df.reset_index(drop=True)
+        market_ret = market_ret.set_index('Trddt')
+        rf = rf.set_index('Trddt')
+        # 构建超额收益
+        excess_stock = daily_ret.sub(rf['Nrrdaydt'], axis=0)
+        excess_market = market_ret['Cdretwdos'] - rf['Nrrdaydt']
+        # 计算 beta
+        beta = excess_stock.copy()#构建一个空表 
+        beta.iloc[:, :] = np.nan
+        for col in excess_stock.columns: #遍历每一只股票
+            stock_r = excess_stock[col].dropna() #去掉空值
+            market_r = excess_market.loc[stock_r.index].dropna()  #取出某只股票的超额收益并且去掉空值
+            combined_index = stock_r.index.intersection(market_r.index)   # 找出“股票收益”和“市场收益”这两个时间序列共有的日期
+            if len(combined_index) < min_obs_corr: continue  #如果共有的日期小于750天就跳过
+                continue
+            #再次确认每只股票的收益和市场收益是不是在相同日期上有值
+            stock_r = stock_r.loc[combined_index]
+            market_r = market_r.loc[combined_index]
+
+            corr = stock_r.corr(market_r) #计算当前这只股票的超额收益率（stock_r）和市场超额收益率（market_r）之间的相关性（皮尔逊相关系数）
+            std_stock = np.log1p(stock_r).rolling(min_obs_vol).std().iloc[-1]   # 计算当前这只股票的超额收益率（stock_r）在过去120天内的标准差；np.log1p(stock_r)取对数
+            std_market = np.log1p(market_r).rolling(min_obs_vol).std().iloc[-1] 
+
+            if not np.isnan(corr) and std_market != 0:  #确保相关系数有效且市场标准差不是0才能计算
+                beta.loc[combined_index[-1], col] = corr * (std_stock / std_market)  #写入计算出的 CAPM beta 值
+
+        # 月末对齐
+        beta['Trdmnt'] = beta.index
+        beta.Trdmnt = beta.Trdmnt.apply(lambda x: x[0:6])
+        beta.drop_duplicates(subset=['Trdmnt'], keep='last', inplace=True)
+        beta.set_index('Trdmnt', inplace=True)
+        return beta
+
+    #LTurnover（Turnover）这个因子好像已经出现在第244行到251行的代码块中，并且多加了滚动 + 对数平滑处理
+    def calc_turnover(self): 
+        volume = self.get_data('TRD_Mnth', 'Mnshrtrd')  # 每月交易股数
+        mv = self.get_data('TRD_Mnth', 'Msmvosd')       # 每月流通市值
+        price = self.get_data('TRD_Mnth', 'Mclsprc')    # 每月收盘价
+
+        shrout = mv / price # 估算流通股数
+        volume_lag = volume.shift(1)  # 计算上月交易量
+        turnover = volume.shift(1) / shrount  # Turnover = 上月成交量 / 当月流通股数
+        return turnover 
+
+    #MktBeta（Market Beta）
+    def calc_mktbeta(self, trading_day_num=120, min_day_num=40):
+        # 获取数据：股票月度收益、市值、市场收益、无风险收益
+        daily_ret = self.get_data('TRD_Dalyr', 'Dretwd')
+        market_ret = self.get_data('TRD_Cndalym', 'Cdretwdos')
+        rf = self.get_data('TRD_Nrrate', 'Nrrdaydt')
+
+        # 计算市场超额回报率（市场回报 - 无风险利率）
+        market_and_rf = market_ret.merge(rf, on=['Trddt']) #根据日期（Trddt）对齐数据，这样每行就同时包含了某一天的市场回报和无风险利率
+        rf_values = np.array(market_and_rf.iloc[:, -1]) # 无风险利率
+        x = np.array(market_and_rf.iloc[:, -2]) - rf_values  # 市场超额回报率
+        x = sm.add_constant(x)  # 给市场回报率加上常数项
+
+        # 初始化结果数据框
+        result = daily_ret.copy()
+        result.iloc[:, :] = np.nan
+
+        for j in range(result.shape[1]):
+            # 计算每只股票的超额回报率
+            y = np.array(daily_ret.iloc[:, j]) - rf_values
+            # 使用滚动回归模型来计算每只股票的 Beta
+            model = RollingOLS(y, x, window=trading_day_num, min_nobs=min_day_num).fit()
+            result.iloc[:, j] = model.params[:, -1]  # Beta 是回归系数中的最后一列
+
+        # 格式化结果为每月的最后一天
+        result['Trdmnt'] = list(result.index)
+        result['Trdmnt'] = result['Trdmnt'].apply(lambda x: x[0:6])
+        result.drop_duplicates(subset=['Trdmnt'], keep='last', inplace=True)
+        result.set_index('Trdmnt', inplace=True)
+
+        return result
+        
+
+
+
+
 
 # end class
 
